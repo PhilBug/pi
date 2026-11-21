@@ -253,6 +253,23 @@ function parseLegacyEncryptedReasoningDetail(
 	}
 }
 
+function parseCopilotReasoningReplay(signature: string | undefined): CopilotReasoningReplay | undefined {
+	if (!signature) return undefined;
+	try {
+		const parsed = JSON.parse(signature) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+		const replay = parsed as Partial<CopilotReasoningReplay>;
+		return replay.version === 1 &&
+			typeof replay.reasoning_opaque === "string" &&
+			replay.reasoning_opaque.length > 0 &&
+			(replay.reasoning_text === undefined || typeof replay.reasoning_text === "string")
+			? (replay as CopilotReasoningReplay)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function fillMissingCommonReasoningDetailFields(
 	target: OpenAIReasoningDetailBase,
 	source: OpenAIReasoningDetail,
@@ -286,8 +303,14 @@ function isOpenAICompletionsReasoningField(field: string): field is OpenAIComple
 	return OPENAI_COMPLETIONS_REASONING_FIELDS.includes(field as OpenAICompletionsReasoningField);
 }
 
+type CopilotReasoningReplay = {
+	version: 1;
+	reasoning_opaque: string;
+	reasoning_text?: string;
+};
+
 type ChatCompletionAssistantMessageParamWithReasoning = ChatCompletionAssistantMessageParam &
-	Partial<Record<OpenAICompletionsReasoningField, string>> & {
+	Partial<Record<OpenAICompletionsReasoningField | "reasoning_opaque", string>> & {
 		reasoning_details?: JsonValue[];
 	};
 
@@ -336,12 +359,15 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			timestamp: Date.now(),
 		};
 
-		// `reasoning_details` are replay metadata, not user-visible stream deltas.
-		// Keep them in memory during streaming and serialize once when the block is finalized.
+		// Replay metadata is not user-visible stream content. Keep it in memory and
+		// serialize it once when the thinking block is finalized.
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
-		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
+		let streamedCopilotReasoning: CopilotReasoningReplay | undefined;
+		const applyStreamedReasoningReplay = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
+			} else if (streamedCopilotReasoning !== undefined) {
+				block.thinkingSignature = JSON.stringify(streamedCopilotReasoning);
 			}
 		};
 
@@ -433,7 +459,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						partial: output,
 					});
 				} else if (block.type === "thinking") {
-					applyStreamedReasoningDetails(block);
+					applyStreamedReasoningReplay(block);
 					stream.push({
 						type: "thinking_end",
 						contentIndex,
@@ -610,6 +636,19 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						}
 					}
 
+					const reasoningOpaque = (choice.delta as { reasoning_opaque?: unknown }).reasoning_opaque;
+					if (typeof reasoningOpaque === "string" && reasoningOpaque.length > 0) {
+						const block = ensureThinkingBlock("reasoning_text");
+						streamedCopilotReasoning = {
+							version: 1,
+							reasoning_opaque: reasoningOpaque,
+							...(block.thinking.length > 0 ? { reasoning_text: block.thinking } : {}),
+						};
+					} else if (streamedCopilotReasoning && typeof deltaFields.reasoning_text === "string") {
+						streamedCopilotReasoning.reasoning_text =
+							(streamedCopilotReasoning.reasoning_text ?? "") + deltaFields.reasoning_text;
+					}
+
 					const reasoningDetails = (choice.delta as { reasoning_details?: unknown }).reasoning_details;
 					if (Array.isArray(reasoningDetails)) {
 						for (const detail of reasoningDetails) {
@@ -696,7 +735,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		} catch (error) {
 			for (const block of output.content) {
 				if (block.type === "thinking") {
-					applyStreamedReasoningDetails(block);
+					applyStreamedReasoningReplay(block);
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -1307,6 +1346,9 @@ export function convertMessages(
 			const signedReasoningDetails = thinkingBlocks
 				.map((block) => parseOpenAIReasoningDetails(block.thinkingSignature))
 				.find((details) => details !== undefined);
+			const copilotReasoningReplay = thinkingBlocks
+				.map((block) => parseCopilotReasoningReplay(block.thinkingSignature))
+				.find((replay) => replay !== undefined);
 			const legacyReasoningDetails = toolCalls
 				.map((toolCall) => parseLegacyEncryptedReasoningDetail(toolCall.thoughtSignature))
 				.filter((detail): detail is OpenAIEncryptedReasoningDetail => detail !== undefined);
@@ -1377,6 +1419,11 @@ export function convertMessages(
 			}
 			if (preservedReasoningDetails) {
 				assistantMsg.reasoning_details = preservedReasoningDetails;
+			} else if (copilotReasoningReplay) {
+				assistantMsg.reasoning_opaque = copilotReasoningReplay.reasoning_opaque;
+				if (copilotReasoningReplay.reasoning_text !== undefined) {
+					assistantMsg.reasoning_text = copilotReasoningReplay.reasoning_text;
+				}
 			}
 			if (
 				compat.requiresReasoningContentOnAssistantMessages &&
