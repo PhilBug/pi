@@ -75,6 +75,13 @@ function model(): Model<"openai-completions"> {
 	};
 }
 
+const copilotModel: Model<"openai-completions"> = {
+	...model(),
+	id: "gemini-4-neon",
+	provider: "github-copilot",
+	baseUrl: "https://api.individual.githubcopilot.com",
+};
+
 function chunk(delta: Record<string, unknown>, finishReason: string | null = null): unknown {
 	return {
 		id: "chatcmpl-test",
@@ -96,8 +103,11 @@ function toolCallChunk(): unknown {
 	});
 }
 
-async function runOpenAICompletionsStream(messages: AssistantMessage[] = []): Promise<AssistantMessage> {
-	return await streamOpenAICompletions(model(), normalizeContext({ messages, tools: [readTool] }), {
+async function runOpenAICompletionsStream(
+	messages: AssistantMessage[] = [],
+	streamModel = model(),
+): Promise<AssistantMessage> {
+	return await streamOpenAICompletions(streamModel, normalizeContext({ messages, tools: [readTool] }), {
 		apiKey: "test",
 	}).result();
 }
@@ -160,19 +170,20 @@ describe("openai-completions reasoning_details streaming", () => {
 	it("preserves GitHub Copilot reasoning replay fields", async () => {
 		mockState.chunkSets = [
 			[
-				chunk({ reasoning_text: "Inspect " }),
-				chunk({ reasoning_text: "the file.", reasoning_opaque: "copilot-signature" }),
+				chunk({ reasoning_content: "Displayed summary.", reasoning_text: "Inspect " }),
+				chunk({ reasoning_text: "the ", reasoning_opaque: "copilot-signature" }),
+				chunk({ reasoning_text: "file." }),
 				toolCallChunk(),
 				chunk({}, "tool_calls"),
 			],
 			[chunk({ content: "ok" }), chunk({}, "stop")],
 		];
 
-		const assistantMessage = await runOpenAICompletionsStream();
+		const assistantMessage = await runOpenAICompletionsStream([], copilotModel);
 		const thinking = assistantMessage.content.find((block) => block.type === "thinking");
 		expect(thinking).toEqual({
 			type: "thinking",
-			thinking: "Inspect the file.",
+			thinking: "Displayed summary.the file.",
 			thinkingSignature: JSON.stringify({
 				version: 1,
 				reasoning_opaque: "copilot-signature",
@@ -180,7 +191,7 @@ describe("openai-completions reasoning_details streaming", () => {
 			}),
 		});
 
-		await runOpenAICompletionsStream([assistantMessage]);
+		await runOpenAICompletionsStream([assistantMessage], copilotModel);
 
 		expect(getAssistantPayload(mockState.payloads[1])).toMatchObject({
 			reasoning_opaque: "copilot-signature",
@@ -189,14 +200,15 @@ describe("openai-completions reasoning_details streaming", () => {
 		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_details).toBeUndefined();
 	});
 
-	it("keeps opaque-only Copilot reasoning attached to tool calls", async () => {
+	it("replays an opaque signature received with the Copilot tool-call finish reason", async () => {
 		mockState.chunkSets = [
-			[chunk({ reasoning_opaque: "opaque-only-signature" }), toolCallChunk(), chunk({}, "tool_calls")],
+			[toolCallChunk(), chunk({ reasoning_opaque: "opaque-only-signature" }, "tool_calls")],
 			[chunk({ content: "ok" }), chunk({}, "stop")],
 		];
 
-		const assistantMessage = await runOpenAICompletionsStream();
-		expect(assistantMessage.content[0]).toEqual({
+		const assistantMessage = await runOpenAICompletionsStream([], copilotModel);
+		expect(assistantMessage.stopReason).toBe("toolUse");
+		expect(assistantMessage.content.find((block) => block.type === "thinking")).toEqual({
 			type: "thinking",
 			thinking: "",
 			thinkingSignature: JSON.stringify({
@@ -205,12 +217,67 @@ describe("openai-completions reasoning_details streaming", () => {
 			}),
 		});
 
-		await runOpenAICompletionsStream([assistantMessage]);
+		await runOpenAICompletionsStream([assistantMessage], copilotModel);
 
 		expect(getAssistantPayload(mockState.payloads[1])).toMatchObject({
 			reasoning_opaque: "opaque-only-signature",
 		});
 		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_text).toBeUndefined();
+	});
+
+	it("still rejects a Copilot tool-call stream without a finish reason", async () => {
+		mockState.chunkSets = [[toolCallChunk(), chunk({ reasoning_opaque: "copilot-signature" })]];
+
+		const assistantMessage = await runOpenAICompletionsStream([], copilotModel);
+		expect(assistantMessage).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Stream ended without finish_reason",
+		});
+	});
+
+	it("ignores opaque reasoning from other providers", async () => {
+		mockState.chunkSets = [
+			[
+				chunk({ reasoning_text: "Other summary.", reasoning_opaque: "ignored" }),
+				toolCallChunk(),
+				chunk({}, "tool_calls"),
+			],
+			[chunk({ content: "ok" }), chunk({}, "stop")],
+		];
+
+		const assistantMessage = await runOpenAICompletionsStream();
+		expect(assistantMessage.content[0]).toMatchObject({ thinkingSignature: "reasoning_text" });
+
+		await runOpenAICompletionsStream([assistantMessage]);
+		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_text).toBe("Other summary.");
+		expect(getAssistantPayload(mockState.payloads[1])?.reasoning_opaque).toBeUndefined();
+	});
+
+	it("does not replay Copilot metadata stored in older non-Copilot history", async () => {
+		mockState.chunkSets = [[chunk({ content: "ok" }), chunk({}, "stop")]];
+		const previous: AssistantMessage = {
+			role: "assistant",
+			api: "openai-completions",
+			provider: model().provider,
+			model: model().id,
+			content: [
+				{ type: "thinking", thinking: "Summary", thinkingSignature: '{"version":1,"reasoning_opaque":"old"}' },
+				{ type: "text", text: "Answer" },
+			],
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+		};
+
+		await runOpenAICompletionsStream([previous]);
+		expect(getAssistantPayload(mockState.payloads[0])?.reasoning_opaque).toBeUndefined();
 	});
 
 	it("falls back to encrypted tool-call signatures for older stored assistant messages", async () => {
